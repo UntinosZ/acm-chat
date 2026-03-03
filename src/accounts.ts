@@ -1,11 +1,20 @@
 import { isSecretRef } from "openclaw/plugin-sdk";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import {
-  DEFAULT_ACCOUNT_ID,
-  normalizeAccountId,
-  normalizeOptionalAccountId,
-} from "openclaw/plugin-sdk/account-id";
 import type { GoogleChatAccountConfig } from "./types.config.js";
+
+// openclaw/plugin-sdk/account-id was added in a newer openclaw version.
+// Implement the helpers inline so the plugin works on older versions too.
+const DEFAULT_ACCOUNT_ID = "default";
+
+function normalizeAccountId(id?: string | null): string {
+  const trimmed = id?.trim();
+  return trimmed || DEFAULT_ACCOUNT_ID;
+}
+
+function normalizeOptionalAccountId(id?: string | null): string | undefined {
+  const trimmed = id?.trim();
+  return trimmed || undefined;
+}
 
 export type GoogleChatCredentialSource = "file" | "inline" | "env" | "none";
 
