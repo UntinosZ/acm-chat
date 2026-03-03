@@ -47,7 +47,7 @@ import {
   resolveGoogleChatOutboundSpace,
 } from "./targets.js";
 
-const meta = getChatChannelMeta("acm-chat");
+const meta = getChatChannelMeta("acm-chat" as Parameters<typeof getChatChannelMeta>[0]);
 
 const formatAllowFromEntry = (entry: string) =>
   entry
@@ -495,7 +495,9 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
           return [];
         }
         const issues: ChannelStatusIssue[] = [];
-        if (!entry.audience) {
+        // Only warn if the field is present in the snapshot (not undefined) but empty.
+        // undefined means the older openclaw didn't include the field — avoid false positives.
+        if ("audience" in (entry as object) && !entry.audience) {
           issues.push({
             channel: "acm-chat",
             accountId,
@@ -504,7 +506,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
             fix: "Set channels.acm-chat.audienceType and channels.acm-chat.audience.",
           });
         }
-        if (!entry.audienceType) {
+        if ("audienceType" in (entry as object) && !entry.audienceType) {
           issues.push({
             channel: "acm-chat",
             accountId,
