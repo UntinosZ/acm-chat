@@ -1,15 +1,39 @@
 import type { OpenClawConfig, DmPolicy } from "openclaw/plugin-sdk";
-import {
+import * as pluginSdk from "openclaw/plugin-sdk";
+
+const {
   addWildcardAllowFrom,
   formatDocsLink,
   mergeAllowFromEntries,
   promptAccountId,
-  type ChannelOnboardingAdapter,
-  type ChannelOnboardingDmPolicy,
-  type WizardPrompter,
-  DEFAULT_ACCOUNT_ID,
-  normalizeAccountId,
-  migrateBaseNameToDefaultAccount,
+} = pluginSdk as unknown as {
+  addWildcardAllowFrom: (entries: unknown[]) => unknown[];
+  formatDocsLink: (path: string, label: string) => string;
+  mergeAllowFromEntries: (existing: unknown, additions: string[]) => string[];
+  promptAccountId: (params: {
+    cfg: OpenClawConfig;
+    prompter: unknown;
+    label: string;
+    currentId: string;
+    listAccountIds: (cfg: OpenClawConfig) => string[];
+    defaultAccountId: string;
+  }) => Promise<string>;
+};
+
+// Fallbacks for constants/simple helpers that may be absent in older openclaw versions
+const _sdk = pluginSdk as unknown as Record<string, unknown>;
+const DEFAULT_ACCOUNT_ID: string = (_sdk["DEFAULT_ACCOUNT_ID"] as string | undefined) ?? "default";
+const normalizeAccountId: (id?: string | null) => string =
+  (_sdk["normalizeAccountId"] as ((id?: string | null) => string) | undefined) ??
+  ((id?: string | null) => id?.trim() || "default");
+const migrateBaseNameToDefaultAccount: (params: { cfg: OpenClawConfig; channelKey: string }) => OpenClawConfig =
+  (_sdk["migrateBaseNameToDefaultAccount"] as ((p: { cfg: OpenClawConfig; channelKey: string }) => OpenClawConfig) | undefined) ??
+  (({ cfg }) => cfg);
+
+import type {
+  ChannelOnboardingAdapter,
+  ChannelOnboardingDmPolicy,
+  WizardPrompter,
 } from "openclaw/plugin-sdk";
 import {
   listGoogleChatAccountIds,

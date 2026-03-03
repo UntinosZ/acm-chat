@@ -1,13 +1,11 @@
+import * as pluginSdk from "openclaw/plugin-sdk";
 import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,
-  DEFAULT_ACCOUNT_ID,
   deleteAccountFromConfigSection,
   formatPairingApproveHint,
   getChatChannelMeta,
-  migrateBaseNameToDefaultAccount,
   missingTargetError,
-  normalizeAccountId,
   PAIRING_APPROVED_MESSAGE,
   resolveChannelMediaMaxBytes,
   resolveGoogleChatGroupRequireMention,
@@ -20,6 +18,16 @@ import {
   type ChannelStatusIssue,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk";
+
+// Fallbacks for constants/simple helpers that may be absent in older openclaw versions
+const _sdk = pluginSdk as unknown as Record<string, unknown>;
+const DEFAULT_ACCOUNT_ID: string = (_sdk["DEFAULT_ACCOUNT_ID"] as string | undefined) ?? "default";
+const normalizeAccountId: (id?: string | null) => string =
+  (_sdk["normalizeAccountId"] as ((id?: string | null) => string) | undefined) ??
+  ((id?: string | null) => id?.trim() || "default");
+const migrateBaseNameToDefaultAccount: (params: { cfg: OpenClawConfig; channelKey: string }) => OpenClawConfig =
+  (_sdk["migrateBaseNameToDefaultAccount"] as ((p: { cfg: OpenClawConfig; channelKey: string }) => OpenClawConfig) | undefined) ??
+  (({ cfg }) => cfg);
 import { GoogleChatConfigSchema } from "openclaw/plugin-sdk";
 import {
   listGoogleChatAccountIds,

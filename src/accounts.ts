@@ -1,10 +1,16 @@
-import { isSecretRef } from "openclaw/plugin-sdk";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type { GoogleChatAccountConfig } from "./types.config.js";
 
-// openclaw/plugin-sdk/account-id was added in a newer openclaw version.
-// Implement the helpers inline so the plugin works on older versions too.
+// These helpers are either missing from older openclaw versions or were moved
+// to sub-path exports. Implement them inline for broad compatibility.
 const DEFAULT_ACCOUNT_ID = "default";
+
+type SecretRef = { source: string; provider: string; id: string };
+function isSecretRef(value: unknown): value is SecretRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v["source"] === "string" && typeof v["provider"] === "string" && typeof v["id"] === "string";
+}
 
 function normalizeAccountId(id?: string | null): string {
   const trimmed = id?.trim();

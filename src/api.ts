@@ -1,5 +1,11 @@
 import crypto from "node:crypto";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk";
+import * as pluginSdk from "openclaw/plugin-sdk";
+
+// fetchWithSsrFGuard was added in a newer openclaw version; fall back to plain fetch on older versions
+type FetchWithSsrFGuardFn = (params: { url: string; init?: RequestInit }) => Promise<{ response: Response; release: () => void }>;
+const _fetchWithSsrFGuard = (pluginSdk as unknown as Record<string, unknown>)["fetchWithSsrFGuard"] as FetchWithSsrFGuardFn | undefined;
+const fetchWithSsrFGuard: FetchWithSsrFGuardFn = _fetchWithSsrFGuard ??
+  (async ({ url, init }) => { const response = await fetch(url, init); return { response, release: () => {} }; });
 import type { ResolvedGoogleChatAccount } from "./accounts.js";
 import { getGoogleChatAccessToken } from "./auth.js";
 import type { GoogleChatReaction } from "./types.js";
