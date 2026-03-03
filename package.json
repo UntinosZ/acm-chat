@@ -7,6 +7,9 @@
   "dependencies": {
     "google-auth-library": "^10.6.1"
   },
+  "bundledDependencies": [
+    "google-auth-library"
+  ],
   "peerDependencies": {
     "openclaw": ">=2026.3.1"
   },
