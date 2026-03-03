@@ -1,11 +1,84 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import {
-  beginWebhookRequestPipelineOrReject,
-  readJsonWebhookBodyOrReject,
-  resolveWebhookTargetWithAuthOrReject,
-  resolveWebhookTargets,
-  type WebhookInFlightLimiter,
-} from "openclaw/plugin-sdk";
+import * as pluginSdkMod from "openclaw/plugin-sdk";
+import type { WebhookInFlightLimiter } from "openclaw/plugin-sdk";
+
+const _sdkW = pluginSdkMod as unknown as Record<string, unknown>;
+
+// resolveWebhookTargets fallback: match request path against the targets map
+type ResolvedTargets<T> = { path: string; targets: T[] } | null;
+const _resolveWebhookTargets = _sdkW["resolveWebhookTargets"] as
+  | (<T>(req: IncomingMessage, map: Map<string, T[]>) => ResolvedTargets<T>)
+  | undefined;
+function resolveWebhookTargets<T>(req: IncomingMessage, map: Map<string, T[]>): ResolvedTargets<T> {
+  if (_resolveWebhookTargets) return _resolveWebhookTargets(req, map);
+  const path = (req.url ?? "").split("?")[0] ?? "";
+  const found = map.get(path);
+  if (!found?.length) return null;
+  return { path, targets: found };
+}
+
+// beginWebhookRequestPipelineOrReject fallback: validate method, return release noop
+type PipelineResult = { ok: boolean; release: () => void };
+const _beginWebhookRequestPipelineOrReject = _sdkW["beginWebhookRequestPipelineOrReject"] as
+  | ((p: { req: IncomingMessage; res: ServerResponse; allowMethods?: string[]; requireJsonContentType?: boolean; inFlightLimiter?: unknown; inFlightKey?: string }) => PipelineResult)
+  | undefined;
+function beginWebhookRequestPipelineOrReject(params: {
+  req: IncomingMessage; res: ServerResponse; allowMethods?: string[];
+  requireJsonContentType?: boolean; inFlightLimiter?: unknown; inFlightKey?: string;
+}): PipelineResult {
+  if (_beginWebhookRequestPipelineOrReject) return _beginWebhookRequestPipelineOrReject(params);
+  const method = (params.req.method ?? "").toUpperCase();
+  if (params.allowMethods && !params.allowMethods.includes(method)) {
+    params.res.statusCode = 405;
+    params.res.setHeader("Allow", params.allowMethods.join(", "));
+    params.res.end("Method Not Allowed");
+    return { ok: false, release: () => {} };
+  }
+  return { ok: true, release: () => {} };
+}
+
+// readJsonWebhookBodyOrReject fallback: read and parse request body as JSON
+type BodyResult = { ok: boolean; value?: unknown };
+const _readJsonWebhookBodyOrReject = _sdkW["readJsonWebhookBodyOrReject"] as
+  | ((p: { req: IncomingMessage; res: ServerResponse; profile?: string; emptyObjectOnEmpty?: boolean; invalidJsonMessage?: string }) => Promise<BodyResult>)
+  | undefined;
+async function readJsonWebhookBodyOrReject(params: {
+  req: IncomingMessage; res: ServerResponse; profile?: string;
+  emptyObjectOnEmpty?: boolean; invalidJsonMessage?: string;
+}): Promise<BodyResult> {
+  if (_readJsonWebhookBodyOrReject) return _readJsonWebhookBodyOrReject(params);
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    params.req.on("data", (chunk: unknown) => chunks.push(Buffer.from(chunk as Buffer)));
+    params.req.on("end", resolve);
+    params.req.on("error", reject);
+  });
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw && params.emptyObjectOnEmpty) return { ok: true, value: {} };
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch {
+    params.res.statusCode = 400;
+    params.res.end(params.invalidJsonMessage ?? "invalid JSON");
+    return { ok: false };
+  }
+}
+
+// resolveWebhookTargetWithAuthOrReject fallback: iterate targets and call isMatch
+const _resolveWebhookTargetWithAuthOrReject = _sdkW["resolveWebhookTargetWithAuthOrReject"] as
+  | (<T>(p: { targets: T[]; res: ServerResponse; isMatch: (t: T) => Promise<boolean> }) => Promise<T | null>)
+  | undefined;
+async function resolveWebhookTargetWithAuthOrReject<T>(params: {
+  targets: T[]; res: ServerResponse; isMatch: (target: T) => Promise<boolean>;
+}): Promise<T | null> {
+  if (_resolveWebhookTargetWithAuthOrReject) return _resolveWebhookTargetWithAuthOrReject(params);
+  for (const target of params.targets) {
+    if (await params.isMatch(target)) return target;
+  }
+  params.res.statusCode = 401;
+  params.res.end("unauthorized");
+  return null;
+}
 import { verifyGoogleChatRequest } from "./auth.js";
 import type { WebhookTarget } from "./monitor-types.js";
 import type {

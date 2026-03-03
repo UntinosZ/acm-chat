@@ -1,13 +1,61 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import * as pluginSdk from "openclaw/plugin-sdk";
-import {
-  createReplyPrefixOptions,
-  registerWebhookTargetWithPluginRoute,
-  resolveInboundRouteEnvelopeBuilderWithRuntime,
-  resolveWebhookPath,
-} from "openclaw/plugin-sdk";
-import { type ResolvedGoogleChatAccount } from "./accounts.js";
+
+const _sdk = pluginSdk as unknown as Record<string, unknown>;
+
+// createWebhookInFlightLimiter - introduced in newer openclaw; fall back to null
+const _createLimiter = _sdk["createWebhookInFlightLimiter"] as (() => unknown) | undefined;
+const webhookInFlightLimiter = _createLimiter?.() ?? null;
+
+// resolveWebhookPath fallback: parse from webhookUrl or return defaultPath
+type ResolveWebhookPathParams = { webhookPath?: string | null; webhookUrl?: string | null; defaultPath?: string | null };
+const _resolveWebhookPath = _sdk["resolveWebhookPath"] as ((p: ResolveWebhookPathParams) => string | null) | undefined;
+function resolveWebhookPath(params: ResolveWebhookPathParams): string | null {
+  if (_resolveWebhookPath) return _resolveWebhookPath(params);
+  if (params.webhookPath?.trim()) return params.webhookPath.trim();
+  if (params.webhookUrl?.trim()) {
+    try { return new URL(params.webhookUrl).pathname; } catch { /* ignore */ }
+  }
+  return (params.defaultPath as string | null | undefined) ?? null;
+}
+
+// registerWebhookTargetWithPluginRoute fallback: register in local map only on older openclaw
+// (incoming requests won't be routed by openclaw, but outbound messages still work)
+type RouteRegistration = { unregister: () => void };
+const _registerWebhookTargetWithPluginRoute = _sdk["registerWebhookTargetWithPluginRoute"] as ((p: unknown) => RouteRegistration) | undefined;
+function registerWebhookTargetWithPluginRoute(params: {
+  targetsByPath: Map<string, WebhookTarget[]>;
+  target: WebhookTarget;
+  route: {
+    auth: string; match: string; pluginId: string; source: string; accountId: string;
+    log?: (msg: string) => void;
+    handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  };
+}): RouteRegistration {
+  if (_registerWebhookTargetWithPluginRoute) return _registerWebhookTargetWithPluginRoute(params);
+  // Fallback: add to local map so our handler can process requests if they arrive
+  const path = params.target.path;
+  const existing = params.targetsByPath.get(path) ?? [];
+  params.targetsByPath.set(path, [...existing, params.target]);
+  return {
+    unregister: () => {
+      const cur = params.targetsByPath.get(path) ?? [];
+      const filtered = cur.filter((t) => t !== params.target);
+      if (filtered.length === 0) params.targetsByPath.delete(path);
+      else params.targetsByPath.set(path, filtered);
+    },
+  };
+}
+
+// resolveInboundRouteEnvelopeBuilderWithRuntime and createReplyPrefixOptions:
+// access via sdk; if absent, calls will throw at message-processing time (not at startup)
+const resolveInboundRouteEnvelopeBuilderWithRuntime = _sdk["resolveInboundRouteEnvelopeBuilderWithRuntime"] as
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ((...args: any[]) => any) | undefined;
+const createReplyPrefixOptions = _sdk["createReplyPrefixOptions"] as
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ((...args: any[]) => any) | undefined;import { type ResolvedGoogleChatAccount } from "./accounts.js";
 import {
   downloadGoogleChatMedia,
   deleteGoogleChatMessage,
@@ -29,13 +77,10 @@ export type { GoogleChatMonitorOptions, GoogleChatRuntimeEnv } from "./monitor-t
 export { isSenderAllowed };
 
 const webhookTargets = new Map<string, WebhookTarget[]>();
-// createWebhookInFlightLimiter was introduced in openclaw >=2026.3.1; fall back to null for older versions
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const _createLimiter = (pluginSdk as any).createWebhookInFlightLimiter as (() => unknown) | undefined;
-const webhookInFlightLimiter = _createLimiter?.() ?? null;
 const googleChatWebhookRequestHandler = createGoogleChatWebhookRequestHandler({
   webhookTargets,
-  webhookInFlightLimiter,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  webhookInFlightLimiter: webhookInFlightLimiter as any,
   processEvent: async (event, target) => {
     await processGoogleChatEvent(event, target);
   },
@@ -200,7 +245,7 @@ async function processMessageWithPipeline(params: {
   }
   const { commandAuthorized, effectiveWasMentioned, groupSystemPrompt } = access;
 
-  const { route, buildEnvelope } = resolveInboundRouteEnvelopeBuilderWithRuntime({
+  const { route, buildEnvelope } = (resolveInboundRouteEnvelopeBuilderWithRuntime ?? (() => { throw new Error("resolveInboundRouteEnvelopeBuilderWithRuntime not available in this openclaw version"); }))({
     cfg: config,
     channel: "acm-chat",
     accountId: account.accountId,
@@ -306,7 +351,7 @@ async function processMessageWithPipeline(params: {
     }
   }
 
-  const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+  const { onModelSelected, ...prefixOptions } = (createReplyPrefixOptions ?? (() => { throw new Error("createReplyPrefixOptions not available in this openclaw version"); }))({
     cfg: config,
     agentId: route.agentId,
     channel: "acm-chat",
