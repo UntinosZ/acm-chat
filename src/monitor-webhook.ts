@@ -90,7 +90,7 @@ function parseGoogleChatInboundPayload(
 
 export function createGoogleChatWebhookRequestHandler(params: {
   webhookTargets: Map<string, WebhookTarget[]>;
-  webhookInFlightLimiter: WebhookInFlightLimiter;
+  webhookInFlightLimiter: WebhookInFlightLimiter | null;
   processEvent: (event: GoogleChatEvent, target: WebhookTarget) => Promise<void>;
 }): (req: IncomingMessage, res: ServerResponse) => Promise<boolean> {
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
@@ -105,7 +105,7 @@ export function createGoogleChatWebhookRequestHandler(params: {
       res,
       allowMethods: ["POST"],
       requireJsonContentType: true,
-      inFlightLimiter: params.webhookInFlightLimiter,
+      inFlightLimiter: params.webhookInFlightLimiter ?? undefined,
       inFlightKey: `${path}:${req.socket?.remoteAddress ?? "unknown"}`,
     });
     if (!requestLifecycle.ok) {

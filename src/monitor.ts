@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import * as pluginSdk from "openclaw/plugin-sdk";
 import {
-  createWebhookInFlightLimiter,
   createReplyPrefixOptions,
   registerWebhookTargetWithPluginRoute,
   resolveInboundRouteEnvelopeBuilderWithRuntime,
@@ -29,7 +29,10 @@ export type { GoogleChatMonitorOptions, GoogleChatRuntimeEnv } from "./monitor-t
 export { isSenderAllowed };
 
 const webhookTargets = new Map<string, WebhookTarget[]>();
-const webhookInFlightLimiter = createWebhookInFlightLimiter();
+// createWebhookInFlightLimiter was introduced in openclaw >=2026.3.1; fall back to null for older versions
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _createLimiter = (pluginSdk as any).createWebhookInFlightLimiter as (() => unknown) | undefined;
+const webhookInFlightLimiter = _createLimiter?.() ?? null;
 const googleChatWebhookRequestHandler = createGoogleChatWebhookRequestHandler({
   webhookTargets,
   webhookInFlightLimiter,
