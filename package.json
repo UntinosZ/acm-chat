@@ -1,0 +1,37 @@
+{
+  "name": "@openclaw/acm-chat",
+  "version": "2026.3.2",
+  "private": true,
+  "description": "OpenClaw ACM Chat channel plugin",
+  "type": "module",
+  "dependencies": {
+    "google-auth-library": "^10.6.1"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.1"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "acm-chat",
+      "label": "ACM Chat",
+      "selectionLabel": "ACM Chat (Chat API)",
+      "detailLabel": "ACM Chat",
+      "docsPath": "/channels/acm-chat",
+      "docsLabel": "acm-chat",
+      "blurb": "ACM Workspace Chat app via HTTP webhooks.",
+      "aliases": [
+        "acmchat",
+        "acm-chat"
+      ],
+      "order": 55
+    },
+    "install": {
+      "npmSpec": "@openclaw/acm-chat",
+      "localPath": "extensions/acm-chat",
+      "defaultChoice": "npm"
+    }
+  }
+}

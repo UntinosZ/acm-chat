@@ -1,0 +1,115 @@
+# =============================================================================
+# acm-chat plugin — ตัวอย่าง config สำหรับ OpenClaw
+# =============================================================================
+# วิธีใช้:
+#   1. คัดลอกไฟล์นี้หรือ merge ส่วนที่ต้องการเข้า ~/.openclaw/config.yaml
+#   2. แทนที่ค่า placeholder ด้วยค่าจริงของคุณ
+#   3. รัน: openclaw plugin install --local extensions/acm-chat
+#   4. รัน: openclaw channels status --probe   (ตรวจสอบว่า channel ขึ้นมาแล้ว)
+# =============================================================================
+
+channels:
+  acm-chat:
+
+    # ── Credentials (เลือก 1 วิธี) ──────────────────────────────────────────
+
+    # วิธี A: ชี้ไปที่ไฟล์ service account JSON (แนะนำ)
+    serviceAccountFile: /path/to/your-service-account.json
+
+    # วิธี B: วาง JSON ของ service account โดยตรง (single-line)
+    # serviceAccount: '{"type":"service_account","project_id":"my-project","private_key_id":"...","private_key":"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n","client_email":"chat-bot@my-project.iam.gserviceaccount.com","client_id":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}'
+
+    # วิธี C: ใช้ environment variable (ไม่ต้องใส่ใน config)
+    # export GOOGLE_CHAT_SERVICE_ACCOUNT_FILE=/path/to/service-account.json
+    # หรือ
+    # export GOOGLE_CHAT_SERVICE_ACCOUNT='{"type":"service_account",...}'
+
+    # ── Webhook Audience (REQUIRED) ──────────────────────────────────────────
+    # audienceType เลือก "app-url" (แนะนำ) หรือ "project-number"
+    audienceType: app-url
+    # audience = URL ของ gateway ที่รับ webhook (ต้องตรงกับ Chat App URL ที่ตั้งใน Google Cloud Console)
+    audience: https://your-gateway-host.example.com/acm-chat
+
+    # ── Webhook Path ─────────────────────────────────────────────────────────
+    # default คือ /acm-chat — เปลี่ยนได้ถ้าต้องการ path อื่น
+    webhookPath: /acm-chat
+
+    # ── Direct Message Policy ────────────────────────────────────────────────
+    dm:
+      # policy:
+      #   "pairing"   — ต้องให้ผู้ใช้ส่ง /pair ก่อน (แนะนำ, default)
+      #   "allowlist" — รับเฉพาะ user ที่อยู่ใน allowFrom
+      #   "open"      — รับจากทุกคน (ไม่แนะนำใน production)
+      policy: pairing
+
+      # allowFrom: รายชื่อ user ที่อนุญาต (ใช้เมื่อ policy = "allowlist")
+      # ใส่เป็น Google Workspace email หรือ user resource name (users/...)
+      # allowFrom:
+      #   - name@yourdomain.com
+      #   - users/1234567890
+
+    # ── Space (Group) Policy ─────────────────────────────────────────────────
+    # groupPolicy:
+    #   "open"      — bot ตอบทุก space (mention-gated ถ้า requireMention: true)
+    #   "allowlist" — รับเฉพาะ space ที่ระบุใน groups section ด้านล่าง
+    #   "disabled"  — ปิดการรับ space messages ทั้งหมด
+    groupPolicy: open
+
+    # ต้อง @mention bot ใน space ถึงจะตอบ (default: true)
+    requireMention: true
+
+    # ── Per-Space Config (Optional) ──────────────────────────────────────────
+    # groups:
+    #   # key คือ space resource name จาก Google Chat (spaces/XXXXXXXXXXX)
+    #   spaces/AAABBBCCC111:
+    #     requireMention: false           # ไม่ต้อง mention ใน space นี้
+    #     systemPrompt: |
+    #       คุณคือ ACM Chat assistant สำหรับทีม Engineering
+    #       ตอบเป็นภาษาไทยเสมอ
+    #   spaces/DDDEEEFFF222:
+    #     enabled: false                  # ปิด bot ใน space นี้
+
+    # ── Multi-Account (Optional) ─────────────────────────────────────────────
+    # ถ้าต้องการหลาย service account ให้ใช้ accounts section
+    # accounts:
+    #   default:
+    #     serviceAccountFile: /path/to/primary-service-account.json
+    #     audienceType: app-url
+    #     audience: https://gateway.example.com/acm-chat
+    #   secondary:
+    #     serviceAccountFile: /path/to/secondary-service-account.json
+    #     audienceType: app-url
+    #     audience: https://gateway.example.com/acm-chat-secondary
+    #     webhookPath: /acm-chat-secondary
+    # defaultAccount: default
+
+    # ── Optional Tuning ──────────────────────────────────────────────────────
+    # mediaMaxMb: 20          # ขนาด attachment สูงสุด (MB), default 20
+    # textChunkLimit: 4000    # ขนาด text chunk สูงสุด (chars), default 4000
+    # replyToMode: off        # off | first | all  — threading mode
+    # typingIndicator: message  # none | message | reaction
+    # requireMention: true    # global mention requirement
+    # allowBots: false        # อนุญาตให้ bot message trigger ตอบหรือไม่
+    # actions:
+    #   reactions: true       # เปิด/ปิด reaction actions
+
+# =============================================================================
+# ขั้นตอนการตั้งค่าใน Google Cloud Console
+# =============================================================================
+# 1. สร้าง / เปิดใช้งาน Google Chat API ใน Cloud Console
+#    https://console.cloud.google.com/apis/library/chat.googleapis.com
+#
+# 2. สร้าง Service Account และ download JSON key
+#    IAM & Admin → Service Accounts → Create → Keys → Add Key → JSON
+#    Scopes ที่ต้องการ: https://www.googleapis.com/auth/chat.bot
+#
+# 3. ตั้งค่า Chat App (Google Chat API → Configuration)
+#    - App URL: https://your-gateway-host.example.com/acm-chat
+#    - Authentication Audience: ตาม audienceType ที่เลือก
+#      • app-url     → ใส่ URL เดียวกับ App URL
+#      • project-number → ใส่ Project Number จาก Cloud Console
+#
+# 4. เพิ่ม Service Account ให้มีสิทธิ์ Chat Bot (ถ้าจำเป็น)
+#
+# 5. ตรวจสอบ network: gateway ต้อง accessible จาก internet บน path /acm-chat
+# =============================================================================

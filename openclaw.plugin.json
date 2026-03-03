@@ -1,0 +1,9 @@
+{
+  "id": "acm-chat",
+  "channels": ["acm-chat"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
