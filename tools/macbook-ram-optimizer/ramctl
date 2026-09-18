@@ -1,0 +1,594 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ramctl — RAM triage & tuning helper สำหรับ macOS (Apple Silicon, 16 GB)
+#
+# เป้าหมาย: ทำให้เครื่องที่ต้องเปิด Chrome / VS Code / Docker / Electron apps
+# หลายตัวพร้อมกัน "ไม่ค้าง" โดยไม่เปลี่ยน workflow และไม่ต้องคอยดูเอง
+#
+# ใช้งาน:
+#   ramctl status            ดูสถานะ RAM + แอปที่กิน RAM มากสุด + คำแนะนำ
+#   ramctl top               เปิด top เรียงตาม memory (กด q เพื่อออก)
+#   ramctl setup [--dry-run] ตั้งค่า Docker Desktop / VS Code / Terraform ครั้งเดียว
+#   ramctl quit-idle [--yes] ปิดแอปหนักที่เปิดทิ้งไว้แต่ไม่มีหน้าต่าง (Lens, Beekeeper, Gather)
+#   ramctl docker stop|start|tune
+#   ramctl vscode tune
+#   ramctl watchdog install|uninstall|status|log|check
+#   ramctl audit             ตรวจ login items / background agents ที่ไม่ใช่ของ Apple
+#   ramctl install           ติดตั้งลง ~/.local/bin + เปิด watchdog
+#
+# ตั้งค่าเพิ่มได้ที่ ~/.config/ramctl/config (ดูตัวแปร default ด้านล่าง)
+# =============================================================================
+set -uo pipefail
+
+RAMCTL_VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ramctl"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="$CONFIG_DIR/state"
+LOG_FILE="$HOME/Library/Logs/ramctl-watchdog.log"
+PLIST_LABEL="com.ramctl.watchdog"
+PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+INSTALL_PATH="$HOME/.local/bin/ramctl"
+
+# ---- ค่า default (override ได้ใน $CONFIG_FILE) --------------------------------
+THRESHOLD_FREE_PCT=12        # แจ้งเตือนเมื่อ memory free % ต่ำกว่านี้
+COOLDOWN_SEC=600             # แจ้งเตือนซ้ำได้ทุก ๆ กี่วินาที
+CHECK_INTERVAL_SEC=60        # watchdog ตรวจทุกกี่วินาที
+TOP_N=12                     # แสดงแอปกี่ตัวใน status
+DOCKER_MEM_MIB=4096          # จำกัด RAM ของ Docker VM
+DOCKER_CPUS=4
+DOCKER_SWAP_MIB=1024
+QUIT_CANDIDATES=("Lens" "Beekeeper Studio" "Gather")   # แอปที่ quit-idle จะพิจารณา
+# ------------------------------------------------------------------------------
+
+# shellcheck disable=SC1090
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+PAGE_SIZE=$(sysctl -n hw.pagesize 2>/dev/null || echo 16384)
+MEM_TOTAL_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_BOLD=""; C_OFF=""
+fi
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s▸ %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+ok()   { printf '%s✔ %s%s\n' "$C_GRN" "$*" "$C_OFF"; }
+warn() { printf '%s! %s%s\n' "$C_YEL" "$*" "$C_OFF"; }
+err()  { printf '%s✘ %s%s\n' "$C_RED" "$*" "$C_OFF" >&2; }
+die()  { err "$*"; exit 1; }
+
+require_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "ramctl ใช้ได้เฉพาะบน macOS"
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "ต้องมีคำสั่ง '$1' (ติดตั้ง: brew install $1)"; }
+
+confirm() {
+  # confirm "คำถาม" -> return 0 ถ้าตอบ y
+  local ans
+  read -r -p "$1 [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# ---- Metrics ------------------------------------------------------------------
+
+mem_total_gb() { awk -v b="$MEM_TOTAL_BYTES" 'BEGIN { printf "%.0f", b/1073741824 }'; }
+
+mem_free_pct() {
+  # memory_pressure รายงานค่าเดียวกับ Activity Monitor (System-wide memory free percentage)
+  local v
+  v=$(memory_pressure 2>/dev/null | awk -F': ' '/System-wide memory free percentage/ { gsub(/%/, "", $2); print $2+0; exit }')
+  if [[ -z "$v" ]]; then
+    # fallback: ประมาณจาก vm_stat
+    v=$(vm_stat 2>/dev/null | awk -v ps="$PAGE_SIZE" -v total="$MEM_TOTAL_BYTES" '
+      /Pages free/        { gsub(/\./, "", $3); free=$3 }
+      /Pages inactive/    { gsub(/\./, "", $3); inactive=$3 }
+      /Pages speculative/ { gsub(/\./, "", $3); spec=$3 }
+      END { if (total > 0) printf "%d", (free+inactive+spec)*ps*100/total; else print 0 }')
+  fi
+  printf '%s' "${v:-0}"
+}
+
+vm_pages() {
+  # vm_pages "Pages occupied by compressor" -> จำนวน page
+  vm_stat 2>/dev/null | awk -v key="$1" -F': *' '$1 == key { gsub(/\./, "", $2); print $2+0; exit }'
+}
+
+pages_to_gb() { awk -v p="${1:-0}" -v ps="$PAGE_SIZE" 'BEGIN { printf "%.1f", p*ps/1073741824 }'; }
+
+swap_used() {
+  sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "used") print $(i+2) }'
+}
+
+app_table() {
+  # รวม RSS ของทุก process ตาม app bundle (.app ตัวนอกสุด) -> "rss_kb<TAB>count<TAB>name"
+  # หมายเหตุ: RSS รวม shared memory ซ้ำกันบ้าง ใช้เพื่อจัดอันดับ ไม่ใช่ตัวเลขเป๊ะ
+  ps -axo rss=,comm= 2>/dev/null | awk '
+    {
+      rss = $1; $1 = ""; path = substr($0, 2)
+      name = path
+      if (match(path, /\/[^\/]+\.app\//)) {
+        name = substr(path, RSTART + 1, RLENGTH - 6)
+      } else {
+        n = split(path, parts, "/"); name = parts[n]
+      }
+      if (name ~ /^terraform/)        name = "Terraform (CLI + providers)"
+      else if (name ~ /^com\.docker/) name = "Docker"
+      rssk[name] += rss; cnt[name]++
+    }
+    END { for (n in rssk) printf "%d\t%d\t%s\n", rssk[n], cnt[n], n }' \
+    | sort -rn
+}
+
+kb_to_gb() { awk -v k="${1:-0}" 'BEGIN { printf "%.1f", k/1048576 }'; }
+
+app_rss_kb() {
+  # app_rss_kb "Google Chrome" -> RSS รวม (KB) หรือ 0
+  app_table | awk -F'\t' -v n="$1" '$3 == n { print $1; exit }' | { read -r v; printf '%s' "${v:-0}"; }
+}
+
+# ---- status -------------------------------------------------------------------
+
+cmd_status() {
+  require_macos
+  local free swap comp wired total verdict color
+  free=$(mem_free_pct)
+  swap=$(swap_used)
+  comp=$(pages_to_gb "$(vm_pages 'Pages occupied by compressor')")
+  wired=$(pages_to_gb "$(vm_pages 'Pages wired down')")
+  total=$(mem_total_gb)
+
+  if   (( free >= 20 )); then verdict="ปกติ";          color="$C_GRN"
+  elif (( free >= THRESHOLD_FREE_PCT )); then verdict="เริ่มตึง"; color="$C_YEL"
+  else                        verdict="วิกฤต (จะเริ่มค้าง)"; color="$C_RED"; fi
+
+  log "${C_BOLD}RAM ${total} GB${C_OFF}   free ${color}${free}%${C_OFF} → ${color}${verdict}${C_OFF}"
+  log "swap used ${swap:-?}   compressed ${comp} GB   wired ${wired} GB"
+  log ""
+  log "${C_BOLD}แอปที่ใช้ RAM มากสุด (RSS รวม, โดยประมาณ)${C_OFF}"
+  local table
+  table=$(app_table | head -n "$TOP_N")
+  printf '%s\n' "$table" | awk -F'\t' '{ printf "  %6.1f GB  %3d proc  %s\n", $1/1048576, $2, $3 }'
+  log ""
+  print_hints "$free" "$table"
+}
+
+print_hints() {
+  local free="$1" table="$2" any=0
+  local chrome code docker lens bee gather tf
+  chrome=$(printf '%s\n' "$table" | awk -F'\t' '$3=="Google Chrome"{print $1}')
+  code=$(printf '%s\n' "$table"   | awk -F'\t' '$3=="Visual Studio Code"{print $1}')
+  docker=$(printf '%s\n' "$table" | awk -F'\t' '$3=="Docker"{print $1}')
+  lens=$(printf '%s\n' "$table"   | awk -F'\t' '$3=="Lens"{print $1}')
+  bee=$(printf '%s\n' "$table"    | awk -F'\t' '$3=="Beekeeper Studio"{print $1}')
+  gather=$(printf '%s\n' "$table" | awk -F'\t' '$3=="Gather"{print $1}')
+  tf=$(printf '%s\n' "$table"     | awk -F'\t' '$3 ~ /^Terraform/{print $1}')
+
+  log "${C_BOLD}คำแนะนำ${C_OFF}"
+  if (( ${chrome:-0} > 3145728 )); then
+    any=1; log "  • Chrome ใช้ $(kb_to_gb "$chrome") GB → เปิด chrome://settings/performance ตั้ง Memory Saver = Maximum และปิด extension ที่ไม่ใช้ (chrome://extensions)"
+  fi
+  if (( ${docker:-0} > 4718592 )); then
+    any=1; log "  • Docker ใช้ $(kb_to_gb "$docker") GB → จำกัด VM ที่ ${DOCKER_MEM_MIB} MiB ด้วย 'ramctl docker tune' (ต้อง restart Docker)"
+  fi
+  if (( ${code:-0} > 2097152 )); then
+    any=1; log "  • VS Code ใช้ $(kb_to_gb "$code") GB → รวมเหลือ 1 window, ปิด extension ที่ไม่ใช้ใน workspace, รัน 'ramctl vscode tune'"
+  fi
+  if (( ${lens:-0} > 0 )); then
+    any=1; log "  • Lens เปิดอยู่ ($(kb_to_gb "$lens") GB) → ถ้ายังไม่ใช้ ปิดด้วย 'ramctl quit-idle' (ใช้ k9s ใน Ghostty แทนได้ในงาน routine)"
+  fi
+  if (( ${bee:-0} > 819200 )); then
+    any=1; log "  • Beekeeper Studio ใช้ $(kb_to_gb "$bee") GB → ปิด tab query ที่โหลด result ใหญ่ หรือ 'ramctl quit-idle'"
+  fi
+  if (( ${gather:-0} > 1048576 )); then
+    any=1; log "  • Gather ใช้ $(kb_to_gb "$gather") GB → พิจารณาเปิดใน Chrome tab แทน desktop app (ประหยัด GPU/browser process ชุดหนึ่ง)"
+  fi
+  if (( ${tf:-0} > 1048576 )); then
+    any=1; log "  • Terraform providers ใช้ $(kb_to_gb "$tf") GB → ถ้าไม่ได้รัน plan/apply อยู่ แปลว่ามี process ค้าง: pkill -f terraform-provider"
+  fi
+  if (( free < THRESHOLD_FREE_PCT )); then
+    any=1; log "  • ${C_RED}ตอนนี้วิกฤต${C_OFF}: รัน 'ramctl quit-idle' แล้วปิด Chrome tab ที่ไม่ใช้ก่อน อย่าเพิ่งเปิดโปรแกรมใหม่"
+  fi
+  (( any == 0 )) && log "  ไม่มีอะไรต้องทำ 👍"
+}
+
+cmd_top() {
+  require_macos
+  exec top -o mem -stats pid,command,mem,cmpr,cpu,state -n 25
+}
+
+# ---- Docker Desktop -----------------------------------------------------------
+
+docker_settings_file() {
+  local base="$HOME/Library/Group Containers/group.com.docker"
+  if   [[ -f "$base/settings-store.json" ]]; then printf '%s' "$base/settings-store.json"
+  elif [[ -f "$base/settings.json" ]];       then printf '%s' "$base/settings.json"
+  else return 1; fi
+}
+
+docker_running() { pgrep -xq "Docker" || pgrep -xq "Docker Desktop" || pgrep -q "com.docker.backend"; }
+
+docker_quit_and_wait() {
+  osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+  local _i
+  for _i in $(seq 1 30); do
+    docker_running || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# ตั้งค่า key แบบไม่เดา: ใช้ชื่อ key ตามที่มีในไฟล์ (PascalCase ใน settings-store.json,
+# camelCase ใน settings.json รุ่นเก่า) ถ้าไม่มี key เลยจะเพิ่มตาม convention ของไฟล์นั้น
+docker_set_key() {
+  local file="$1" pascal="$2" value="$3" key
+  local camel="${pascal,}"
+  if   jq -e --arg k "$pascal" 'has($k)' "$file" >/dev/null; then key="$pascal"
+  elif jq -e --arg k "$camel"  'has($k)' "$file" >/dev/null; then key="$camel"
+  elif [[ "$file" == *settings-store.json ]]; then key="$pascal"; warn "ไม่พบ key $pascal ในไฟล์ จะเพิ่มใหม่"
+  else key="$camel"; warn "ไม่พบ key $camel ในไฟล์ จะเพิ่มใหม่"; fi
+  local cur
+  cur=$(jq -r --arg k "$key" '.[$k] // "unset"' "$file")
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] $key: $cur → $value"
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp)
+  jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$file" > "$tmp" && mv "$tmp" "$file"
+  ok "$key: $cur → $value"
+}
+
+cmd_docker_tune() {
+  require_macos; need jq
+  local file
+  file=$(docker_settings_file) || {
+    warn "ไม่พบไฟล์ settings ของ Docker Desktop (ยังไม่เคยเปิด Docker?)"
+    log "ตั้งเองได้ที่ Docker Desktop → Settings → Resources: Memory ${DOCKER_MEM_MIB} MiB, CPUs ${DOCKER_CPUS}, Swap ${DOCKER_SWAP_MIB} MiB"
+    return 1
+  }
+  info "ไฟล์ settings: $file"
+  local was_running=0
+  if docker_running; then
+    was_running=1
+    if [[ "$DRY_RUN" != "1" ]]; then
+      warn "Docker กำลังรันอยู่ ต้องปิดก่อนแก้ค่า (container ที่รันอยู่จะหยุดชั่วคราว)"
+      confirm "ปิด Docker Desktop ตอนนี้?" || { warn "ข้าม docker tune"; return 1; }
+      docker_quit_and_wait || die "ปิด Docker ไม่สำเร็จภายใน 30 วินาที"
+      ok "Docker ปิดแล้ว"
+    fi
+  fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    cp "$file" "$file.bak.$(date +%Y%m%d%H%M%S)"
+    info "สำรองไฟล์เดิมไว้แล้ว (*.bak.*)"
+  fi
+  docker_set_key "$file" "MemoryMiB" "$DOCKER_MEM_MIB"
+  docker_set_key "$file" "Cpus"      "$DOCKER_CPUS"
+  docker_set_key "$file" "SwapMiB"   "$DOCKER_SWAP_MIB"
+
+  # Resource Saver: แค่ตรวจว่ายังเปิดอยู่ (default เปิดใน Docker Desktop ≥ 4.24)
+  local rs
+  rs=$(jq -r '.AutoPauseTimedActivityMonitor // .autoPauseTimedActivityMonitor // "unset"' "$file")
+  if [[ "$rs" == "false" ]]; then
+    warn "Resource Saver ถูกปิดอยู่ → แนะนำเปิดที่ Settings → Resources → Advanced → Enable Resource Saver"
+  else
+    ok "Resource Saver: ${rs} (VM จะลด RAM เกือบเป็นศูนย์เมื่อไม่มี container รัน)"
+  fi
+  if (( was_running )) && [[ "$DRY_RUN" != "1" ]]; then
+    confirm "เปิด Docker Desktop กลับ?" && open -a Docker
+  fi
+  log "หมายเหตุ: ถ้าใช้ OrbStack แทน Docker Desktop ได้ (license อนุญาต) จะประหยัดกว่านี้อีก 2-4 GB โดยไม่ต้องตั้งอะไร"
+}
+
+cmd_docker() {
+  require_macos
+  case "${1:-}" in
+    tune) cmd_docker_tune ;;
+    stop)
+      if command -v docker >/dev/null 2>&1 && docker_running; then
+        local running
+        running=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
+        [[ -n "$running" ]] && warn "container ที่จะหยุด: $running"
+      fi
+      confirm "ปิด Docker Desktop (คืน RAM ของ VM ทั้งหมด)?" || return 1
+      docker_quit_and_wait && ok "Docker ปิดแล้ว (เปิดกลับ: ramctl docker start)" ;;
+    start) open -a Docker && ok "กำลังเปิด Docker Desktop" ;;
+    *) die "ใช้: ramctl docker tune|stop|start" ;;
+  esac
+}
+
+# ---- VS Code ------------------------------------------------------------------
+
+VSCODE_SETTINGS="$HOME/Library/Application Support/Code/User/settings.json"
+
+vscode_snippet() {
+  cat <<'JSON'
+{
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/**": true,
+    "**/.terraform/**": true,
+    "**/.venv/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.next/**": true,
+    "**/coverage/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.terraform": true,
+    "**/.venv": true,
+    "**/dist": true,
+    "**/build": true
+  },
+  "typescript.tsserver.maxTsServerMemory": 2048,
+  "workbench.editor.limit.enabled": true,
+  "workbench.editor.limit.value": 12,
+  "workbench.editor.limit.perEditorGroup": true,
+  "extensions.autoUpdate": "onlyEnabledExtensions",
+  "telemetry.telemetryLevel": "off"
+}
+JSON
+}
+
+cmd_vscode_tune() {
+  require_macos; need jq
+  local snippet
+  snippet=$(mktemp); vscode_snippet > "$snippet"
+  if [[ ! -f "$VSCODE_SETTINGS" ]]; then
+    if [[ "$DRY_RUN" == "1" ]]; then info "[dry-run] จะสร้าง $VSCODE_SETTINGS"; return 0; fi
+    mkdir -p "$(dirname "$VSCODE_SETTINGS")"
+    cp "$snippet" "$VSCODE_SETTINGS"; ok "สร้าง settings.json ใหม่"; return 0
+  fi
+  if ! jq -e . "$VSCODE_SETTINGS" >/dev/null 2>&1; then
+    warn "settings.json มี comment/trailing comma (JSONC) ทำให้ merge อัตโนมัติไม่ได้"
+    log "ให้เปิด VS Code → Cmd+Shift+P → 'Open User Settings (JSON)' แล้ววางค่าต่อไปนี้เข้าไป:"
+    cat "$snippet"; return 1
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] จะ merge ค่าต่อไปนี้เข้า $VSCODE_SETTINGS"; jq -c 'keys' "$snippet"; return 0
+  fi
+  cp "$VSCODE_SETTINGS" "$VSCODE_SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
+  local tmp
+  tmp=$(mktemp)
+  jq -s '.[0] * .[1]' "$VSCODE_SETTINGS" "$snippet" > "$tmp" && mv "$tmp" "$VSCODE_SETTINGS"
+  ok "merge settings แล้ว (สำรองไว้ที่ *.bak.*) — reload window เพื่อให้มีผล"
+  log "ทำเพิ่มเอง (ครั้งเดียว): Extensions → คลิกขวา extension ที่ไม่ใช้กับงานนี้ → 'Disable (Workspace)'"
+}
+
+cmd_vscode() {
+  case "${1:-}" in
+    tune) cmd_vscode_tune ;;
+    *) die "ใช้: ramctl vscode tune" ;;
+  esac
+}
+
+# ---- Terraform ----------------------------------------------------------------
+
+cmd_terraform_tune() {
+  local rc="$HOME/.terraformrc" cache="$HOME/.terraform.d/plugin-cache"
+  if [[ -f "$rc" ]] && grep -q 'plugin_cache_dir' "$rc"; then
+    ok "terraform plugin cache ตั้งไว้แล้ว"; return 0
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then info "[dry-run] จะเพิ่ม plugin_cache_dir ใน $rc"; return 0; fi
+  mkdir -p "$cache"
+  # ตั้งใจเขียน "$HOME" ตรง ๆ: terraform ขยายตัวแปรเองตอนอ่าน .terraformrc
+  # shellcheck disable=SC2016
+  printf '\nplugin_cache_dir = "$HOME/.terraform.d/plugin-cache"\n' >> "$rc"
+  ok "เพิ่ม plugin_cache_dir ใน ~/.terraformrc (init เร็วขึ้น ไม่ดาวน์โหลด provider ซ้ำทุก workspace)"
+}
+
+# ---- setup --------------------------------------------------------------------
+
+DRY_RUN=0
+cmd_setup() {
+  require_macos
+  [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+  log "${C_BOLD}[1/3] Docker Desktop${C_OFF}";  cmd_docker_tune || true
+  log ""; log "${C_BOLD}[2/3] VS Code${C_OFF}"; cmd_vscode_tune || true
+  log ""; log "${C_BOLD}[3/3] Terraform${C_OFF}"; cmd_terraform_tune || true
+  log ""
+  log "${C_BOLD}ทำเองอีก 3 อย่าง (5 นาที ครั้งเดียว)${C_OFF}"
+  log "  1. Chrome: chrome://settings/performance → Memory Saver = Maximum; chrome://extensions ปิดตัวที่ไม่ใช้"
+  log "  2. Chrome: chrome://settings/system → ปิด 'Continue running background apps when Google Chrome is closed'"
+  log "  3. รัน 'ramctl audit' แล้วลบ login items / background agents ที่ไม่จำเป็น"
+  log ""
+  log "ต่อไป: ramctl watchdog install   (แจ้งเตือนก่อนเครื่องจะค้าง)"
+}
+
+# ---- quit-idle ----------------------------------------------------------------
+
+app_running() {
+  osascript -e "tell application \"System Events\" to (name of processes) contains \"$1\"" 2>/dev/null | grep -q true
+}
+
+app_window_count() {
+  # ต้องการสิทธิ์ Accessibility ให้ terminal; ถ้าไม่มีจะคืน "?"
+  local n
+  n=$(osascript -e "tell application \"System Events\" to count windows of process \"$1\"" 2>/dev/null)
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '?'
+}
+
+cmd_quit_idle() {
+  require_macos
+  local yes=0; [[ "${1:-}" == "--yes" ]] && yes=1
+  local app rss wins freed=0
+  for app in "${QUIT_CANDIDATES[@]}"; do
+    app_running "$app" || continue
+    rss=$(kb_to_gb "$(app_rss_kb "$app")")
+    wins=$(app_window_count "$app")
+    case "$wins" in
+      0)
+        osascript -e "quit app \"$app\"" >/dev/null 2>&1 && ok "ปิด $app (ไม่มีหน้าต่าง, คืน ~${rss} GB)"; freed=1 ;;
+      '?')
+        if (( yes )) || confirm "$app เปิดอยู่ (~${rss} GB) ตรวจหน้าต่างไม่ได้ ปิดไหม?"; then
+          osascript -e "quit app \"$app\"" >/dev/null 2>&1 && ok "ปิด $app"; freed=1
+        fi ;;
+      *)
+        info "$app มี $wins หน้าต่าง (~${rss} GB) — ข้าม" ;;
+    esac
+  done
+  (( freed == 0 )) && info "ไม่มีแอปในรายการที่ปิดได้ (แก้รายการได้ที่ QUIT_CANDIDATES ใน $CONFIG_FILE)"
+  return 0
+}
+
+# ---- watchdog -----------------------------------------------------------------
+
+rotate_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size
+  size=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( size > 1048576 )); then
+    tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+cmd_watchdog_check() {
+  require_macos
+  mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")"
+  rotate_log
+  local free now last
+  free=$(mem_free_pct); now=$(date +%s)
+  last=$(cat "$STATE_DIR/last_alert" 2>/dev/null || echo 0)
+  printf '%s free=%s%% swap=%s compressed=%sGB\n' "$(date '+%F %T')" "$free" "$(swap_used)" \
+    "$(pages_to_gb "$(vm_pages 'Pages occupied by compressor')")" >> "$LOG_FILE"
+  if (( free < THRESHOLD_FREE_PCT )) && (( now - last >= COOLDOWN_SEC )); then
+    local top3
+    top3=$(app_table | head -3 | awk -F'\t' '{ printf "%s %.1fG  ", $3, $1/1048576 }')
+    osascript -e "display notification \"$top3\" with title \"RAM เหลือ ${free}% — ใกล้ค้าง\" subtitle \"รัน: ramctl status / ramctl quit-idle\"" >/dev/null 2>&1
+    printf '%s' "$now" > "$STATE_DIR/last_alert"
+    printf '%s ALERT free=%s%% top=%s\n' "$(date '+%F %T')" "$free" "$top3" >> "$LOG_FILE"
+  fi
+}
+
+write_plist() {
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$INSTALL_PATH</string>
+    <string>watchdog</string>
+    <string>check</string>
+  </array>
+  <key>StartInterval</key><integer>$CHECK_INTERVAL_SEC</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+PLIST
+}
+
+launchd_domain() { printf 'gui/%s' "$(id -u)"; }
+
+cmd_watchdog() {
+  require_macos
+  case "${1:-}" in
+    install)
+      [[ -x "$INSTALL_PATH" ]] || die "ยังไม่ได้ติดตั้ง ramctl ที่ $INSTALL_PATH — รัน 'ramctl install' ก่อน"
+      launchctl bootout "$(launchd_domain)/$PLIST_LABEL" >/dev/null 2>&1 || true
+      write_plist
+      launchctl bootstrap "$(launchd_domain)" "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH"
+      ok "watchdog ทำงานแล้ว: ตรวจทุก ${CHECK_INTERVAL_SEC}s แจ้งเตือนเมื่อ free < ${THRESHOLD_FREE_PCT}% (log: $LOG_FILE)"
+      log "ครั้งแรกที่มีแจ้งเตือน macOS จะถามสิทธิ์ Notifications ของ 'Script Editor' → กด Allow" ;;
+    uninstall)
+      launchctl bootout "$(launchd_domain)/$PLIST_LABEL" >/dev/null 2>&1 || launchctl unload "$PLIST_PATH" 2>/dev/null || true
+      rm -f "$PLIST_PATH"; ok "ถอด watchdog แล้ว" ;;
+    status)
+      if launchctl print "$(launchd_domain)/$PLIST_LABEL" >/dev/null 2>&1; then
+        ok "watchdog กำลังทำงาน (threshold ${THRESHOLD_FREE_PCT}%, cooldown ${COOLDOWN_SEC}s)"
+        [[ -f "$LOG_FILE" ]] && tail -n 3 "$LOG_FILE"
+      else
+        warn "watchdog ไม่ได้ทำงาน (ramctl watchdog install)"
+      fi ;;
+    log) tail -n "${2:-50}" "$LOG_FILE" 2>/dev/null || warn "ยังไม่มี log" ;;
+    check) cmd_watchdog_check ;;
+    *) die "ใช้: ramctl watchdog install|uninstall|status|log|check" ;;
+  esac
+}
+
+# ---- audit --------------------------------------------------------------------
+
+cmd_audit() {
+  require_macos
+  log "${C_BOLD}Login items (เปิดอัตโนมัติตอน login)${C_OFF}"
+  osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null | tr ',' '\n' | sed 's/^ */  /'
+  log ""
+  log "${C_BOLD}LaunchAgents / LaunchDaemons ที่ไม่ใช่ของ Apple (ไฟล์)${C_OFF}"
+  local f
+  for f in "$HOME"/Library/LaunchAgents/*.plist /Library/LaunchAgents/*.plist /Library/LaunchDaemons/*.plist; do
+    [[ -e "$f" ]] || continue
+    case "$(basename "$f")" in com.apple.*) ;; *) printf '  %s\n' "$f" ;; esac
+  done
+  log ""
+  log "${C_BOLD}Background jobs ที่รันอยู่ (ไม่ใช่ com.apple.*)${C_OFF}"
+  launchctl list 2>/dev/null | awk 'NR > 1 && $3 !~ /^com\.apple\./ { print "  " $3 }' | sort
+  log ""
+  log "วิธีปิด: System Settings → General → Login Items & Extensions  (ปิดตัวที่ไม่ใช้ เช่น updater ของแอปต่าง ๆ, Creative Cloud, Teams/Zoom helper)"
+  log "แอปที่ควรตั้งให้ 'ไม่เปิดตอน login': Lens, Beekeeper, Docker (เปิดเองเมื่อจะใช้ container)"
+}
+
+# ---- install ------------------------------------------------------------------
+
+cmd_install() {
+  require_macos
+  mkdir -p "$(dirname "$INSTALL_PATH")" "$CONFIG_DIR"
+  local self
+  self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+  if [[ "$self" != "$INSTALL_PATH" ]]; then
+    cp "$self" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+    ok "ติดตั้ง ramctl ที่ $INSTALL_PATH"
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<CFG
+# ramctl config — แก้แล้วมีผลทันที (watchdog อ่านทุกครั้งที่ตรวจ)
+THRESHOLD_FREE_PCT=$THRESHOLD_FREE_PCT
+COOLDOWN_SEC=$COOLDOWN_SEC
+CHECK_INTERVAL_SEC=$CHECK_INTERVAL_SEC
+DOCKER_MEM_MIB=$DOCKER_MEM_MIB
+DOCKER_CPUS=$DOCKER_CPUS
+DOCKER_SWAP_MIB=$DOCKER_SWAP_MIB
+QUIT_CANDIDATES=("Lens" "Beekeeper Studio" "Gather")
+CFG
+    ok "สร้าง config ที่ $CONFIG_FILE"
+  fi
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) warn "เพิ่มใน ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
+  "$INSTALL_PATH" watchdog install
+}
+
+# ---- main ---------------------------------------------------------------------
+
+usage() { sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  case "${1:-help}" in
+    status)     cmd_status ;;
+    top)        cmd_top ;;
+    setup)      shift; cmd_setup "$@" ;;
+    quit-idle)  shift; cmd_quit_idle "$@" ;;
+    docker)     shift; cmd_docker "$@" ;;
+    vscode)     shift; cmd_vscode "$@" ;;
+    terraform)  cmd_terraform_tune ;;
+    watchdog)   shift; cmd_watchdog "$@" ;;
+    audit)      cmd_audit ;;
+    install)    cmd_install ;;
+    version)    log "ramctl $RAMCTL_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) err "ไม่รู้จักคำสั่ง: $1"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

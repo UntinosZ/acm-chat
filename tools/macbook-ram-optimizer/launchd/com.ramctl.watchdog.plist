@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ตัวอย่าง launchd agent ที่ `ramctl watchdog install` สร้างให้อัตโนมัติ
+  ถ้าจะติดตั้งเอง: แทน __HOME__ ด้วย $HOME แล้ว
+    cp com.ramctl.watchdog.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ramctl.watchdog.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ramctl.watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/ramctl</string>
+    <string>watchdog</string>
+    <string>check</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/ramctl-watchdog.log</string>
+</dict>
+</plist>
